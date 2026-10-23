@@ -1,8 +1,6 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta name="google-signin-client_id" content="357387725632-i6i7186ptercmuld4au086gl9u6pm2a9.apps.googleusercontent.com">
-</head>
   <!--
     If you are serving your web app in a path other than the root, change the
     href value below to reflect the base path you are serving from.
@@ -16,11 +14,14 @@
     This is a placeholder for base href that will be replaced by the value of
     the `--base-href` argument provided to `flutter build`.
   -->
-  <base href="/Green-Board-/">
+ <base href="$FLUTTER_BASE_HREF">
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
+  <meta name="description" content="Green Board • B-School Workspace">
+
+  <!-- Google Sign-In Client ID -->
+  <meta name="google-signin-client_id" content="357387725632-i6i7186ptercmuld4au086gl9u6pm2a9.apps.googleusercontent.com">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
@@ -31,10 +32,110 @@
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>green_board</title>
+  <title>Green Board • B-School Workspace</title>
   <link rel="manifest" href="manifest.json">
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #050E0A;
+      overflow: hidden;
+      overscroll-behavior-x: none !important;
+      overscroll-behavior-y: none !important;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+
+    #gb-loading-screen {
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(circle at center, #0B2017 0%, #050E0A 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 999999;
+      transition: opacity 0.4s ease-out;
+    }
+
+    .gb-logo-box {
+      width: 56px;
+      height: 56px;
+      border-radius: 16px;
+      background: rgba(16, 185, 129, 0.16);
+      border: 1.5px solid rgba(52, 211, 153, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 28px rgba(16, 185, 129, 0.35);
+      margin-bottom: 18px;
+      animation: gbPulse 1.8s infinite ease-in-out;
+    }
+
+    .gb-logo-check {
+      color: #34D399;
+      font-size: 28px;
+      font-weight: 900;
+    }
+
+    .gb-title {
+      color: #ECFDF5;
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: 2px;
+      margin-bottom: 6px;
+    }
+
+    .gb-sub {
+      color: rgba(255, 255, 255, 0.5);
+      font-size: 12px;
+      margin-bottom: 22px;
+    }
+
+    .gb-progress-track {
+      width: 180px;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .gb-progress-bar {
+      width: 45%;
+      height: 100%;
+      background: linear-gradient(90deg, #10B981, #34D399);
+      border-radius: 4px;
+      position: absolute;
+      animation: gbSlide 1.2s infinite ease-in-out;
+    }
+
+    @keyframes gbPulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.07); }
+    }
+
+    @keyframes gbSlide {
+      0% { left: -45%; }
+      100% { left: 100%; }
+    }
+  </style>
 </head>
 <body>
+  <!-- Custom Splash Screen -->
+  <div id="gb-loading-screen">
+    <div class="gb-logo-box">
+      <span class="gb-logo-check">✓</span>
+    </div>
+    <div class="gb-title">GREEN BOARD</div>
+    <div class="gb-sub">Calibrating B-School Workspace...</div>
+    <div class="gb-progress-track">
+      <div class="gb-progress-bar"></div>
+    </div>
+  </div>
+
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader

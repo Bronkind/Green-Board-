@@ -132,6 +132,7 @@ class DeadlineItem {
   final String importance;
   bool isCompleted;
   bool isDeleted;
+  bool isNew;
 
   DeadlineItem({
     required this.id,
@@ -145,6 +146,7 @@ class DeadlineItem {
     this.importance = 'Important',
     this.isCompleted = false,
     this.isDeleted = false,
+    this.isNew = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -159,6 +161,7 @@ class DeadlineItem {
         'importance': importance,
         'isCompleted': isCompleted,
         'isDeleted': isDeleted,
+        'isNew': isNew,
       };
 
   factory DeadlineItem.fromJson(Map<String, dynamic> json) => DeadlineItem(
@@ -173,6 +176,7 @@ class DeadlineItem {
         importance: json['importance'] ?? 'Important',
         isCompleted: json['isCompleted'] ?? false,
         isDeleted: json['isDeleted'] ?? false,
+        isNew: json['isNew'] ?? false,
       );
 }
 
@@ -183,7 +187,9 @@ class ReminderItem {
   final String timeLabel;
   final String? gmailMessageId;
   final String source;
+  final DateTime expiresAt;
   bool isDone;
+  bool isNew;
 
   ReminderItem({
     required this.id,
@@ -192,8 +198,10 @@ class ReminderItem {
     required this.timeLabel,
     this.gmailMessageId,
     this.source = 'Gmail',
+    DateTime? expiresAt,
     this.isDone = false,
-  });
+    this.isNew = false,
+  }) : expiresAt = expiresAt ?? DateTime.now().add(const Duration(hours: 6));
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -202,7 +210,9 @@ class ReminderItem {
         'timeLabel': timeLabel,
         'gmailMessageId': gmailMessageId,
         'source': source,
+        'expiresAt': expiresAt.toIso8601String(),
         'isDone': isDone,
+        'isNew': isNew,
       };
 
   factory ReminderItem.fromJson(Map<String, dynamic> json) => ReminderItem(
@@ -212,7 +222,11 @@ class ReminderItem {
         timeLabel: json['timeLabel'],
         gmailMessageId: json['gmailMessageId'],
         source: json['source'] ?? 'Gmail',
+        expiresAt: json['expiresAt'] != null
+            ? DateTime.tryParse(json['expiresAt']) ?? DateTime.now().add(const Duration(hours: 6))
+            : DateTime.now().add(const Duration(hours: 6)),
         isDone: json['isDone'] ?? false,
+        isNew: json['isNew'] ?? false,
       );
 }
 
@@ -253,7 +267,11 @@ class GreenBoardHome extends StatefulWidget {
   State<GreenBoardHome> createState() => _GreenBoardHomeState();
 }
 
-class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProviderStateMixin {
+class _GreenBoardHomeState extends State<GreenBoardHome> with TickerProviderStateMixin {
+  // Secure Google Apps Script Proxy URL (Telegram Token is safely locked inside Google's servers)
+  static const String _feedbackProxyUrl =
+      'https://script.google.com/macros/s/AKfycbwEDmUdK2M7iQonDcH-P_CFTlLb-Sh-ISj7gOy0SnquR3Gj2jyVf7OeX_CBpd9qTytOVQ/exec';
+
   List<String> categories = [
     'All',
     'Placements',
@@ -261,6 +279,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     'Case Comps',
     'Scholarships',
     'Clubs & Comm',
+    'Miscellaneous',
   ];
   String selectedCategory = 'All';
   ViewMode currentView = ViewMode.board;
@@ -268,6 +287,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
   bool _isSyncing = false;
   String _syncProgressText = 'Sync';
   late TabController _statusTabController;
+  late AnimationController _newItemPulseController;
   final ScrollController _scrollController = ScrollController();
   bool _isScrolled = false;
 
@@ -285,16 +305,32 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
   List<Map<String, String>> voiceBoxSubmissions = [];
 
   List<String> syncedAccounts = [];
+  Map<String, int> lastSyncEpochByAccount = {};
   String? savedUserEmail;
   String? savedUserName;
   String? savedUserPhoto;
 
   Timer? _cleanupTimer;
+  Timer? _liveCountdownTicker;
+  Timer? _autoSyncTimer;
+  StreamSubscription<html.PopStateEvent>? _popStateSub;
 
   @override
   void initState() {
     super.initState();
     _statusTabController = TabController(length: 2, vsync: this);
+    _newItemPulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat(reverse: true);
+
+    // 1. Prevent Trackpad Two-Finger Horizontal Swipe from Closing / Navigating Back
+    _setupTrackpadSwipeAndHistoryLock();
+
+    // 2. Dismiss Custom Web Splash Loader once Flutter First Frame Renders
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _removeWebLoadingScreen();
+    });
 
     _loadDataFromLocal().then((_) {
       _runPeriodicCleanup();
@@ -309,9 +345,64 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
       }
     });
 
+    // 3. Auto-cleanup every minute (including 30-min expired reminders removal)
     _cleanupTimer = Timer.periodic(const Duration(minutes: 1), (_) {
       _runPeriodicCleanup();
     });
+
+    // 4. Second-by-Second Live Countdown Ticker for Red/Critical Deadlines
+    _liveCountdownTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final hasActiveCritical = deadlines.any((d) =>
+          !d.isDeleted &&
+          !d.isCompleted &&
+          d.dueDate.difference(DateTime.now()).inHours <= 24);
+      if (hasActiveCritical) {
+        setState(() {});
+      }
+    });
+
+    // 5. Background 30-Minute Auto-Sync Loop
+    _autoSyncTimer = Timer.periodic(const Duration(minutes: 30), (_) {
+      if (!_isSyncing && (_googleSignIn.currentUser != null || savedUserEmail != null)) {
+        _handleGoogleGmailSync(isAuto: true, isBackgroundAutoSync: true);
+      }
+    });
+  }
+
+  void _setupTrackpadSwipeAndHistoryLock() {
+    try {
+      // Inject CSS overscroll-behavior-x: none to block two-finger horizontal swipe navigation
+      final style = html.StyleElement()
+        ..innerHtml = '''
+          html, body {
+            overscroll-behavior-x: none !important;
+            overscroll-behavior-y: none !important;
+          }
+        ''';
+      html.document.head?.append(style);
+
+      // Push guard state to browser history so accidental back gesture stays inside app
+      html.window.history.pushState({'gb_guard': true}, '', html.window.location.href);
+      _popStateSub = html.window.onPopState.listen((event) {
+        html.window.history.pushState({'gb_guard': true}, '', html.window.location.href);
+        if (mounted && currentView != ViewMode.board) {
+          setState(() => currentView = ViewMode.board);
+        }
+      });
+    } catch (_) {}
+  }
+
+  void _removeWebLoadingScreen() {
+    try {
+      final loader = html.document.getElementById('gb-loading-screen');
+      if (loader != null) {
+        loader.style.opacity = '0';
+        Future.delayed(const Duration(milliseconds: 400), () {
+          loader.remove();
+        });
+      }
+    } catch (_) {}
   }
 
   Future<void> _restoreSessionAndQuickSync() async {
@@ -324,9 +415,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
           savedUserPhoto = account.photoUrl;
         });
         _saveDataToLocal();
-        if (!syncedAccounts.contains(account.email)) {
-          _handleGoogleGmailSync(isAuto: true);
-        }
+        _handleGoogleGmailSync(isAuto: true);
       }
     } catch (_) {}
   }
@@ -357,10 +446,26 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     }
   }
 
+  void _markDeadlineInteracted(DeadlineItem item) {
+    if (item.isNew) {
+      setState(() => item.isNew = false);
+      _saveDataToLocal();
+    }
+  }
+
+  void _markReminderInteracted(ReminderItem item) {
+    if (item.isNew) {
+      setState(() => item.isNew = false);
+      _saveDataToLocal();
+    }
+  }
+
+  // Batched 20-Mail Packet Deep Scan + Timestamp-Based Incremental Sync
   Future<void> _handleGoogleGmailSync({
     bool isAuto = false,
     bool switchAccount = false,
     bool forceDeepScan = false,
+    bool isBackgroundAutoSync = false,
   }) async {
     if (_isSyncing) return;
     setState(() {
@@ -373,7 +478,13 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
         await _googleSignIn.signOut();
       }
       GoogleSignInAccount? account = _googleSignIn.currentUser;
-      account ??= await _googleSignIn.signIn();
+      if (account == null) {
+        if (isAuto || isBackgroundAutoSync) {
+          account = await _googleSignIn.signInSilently();
+        } else {
+          account = await _googleSignIn.signIn();
+        }
+      }
 
       if (account == null) {
         setState(() {
@@ -388,15 +499,17 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
       savedUserPhoto = account.photoUrl;
 
       final bool isFirstScanForAccount = !syncedAccounts.contains(account.email) || forceDeepScan;
+      final int? lastSyncSec = lastSyncEpochByAccount[account.email];
+      final int syncStartEpochSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
       if (!mounted) return;
-      if (!isAuto) {
+      if (!isAuto && !isBackgroundAutoSync) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
               isFirstScanForAccount
-                  ? 'First scan for ${account.email}: Running Deep Scan for Deadlines & Campus Reminders...'
-                  : 'Quick syncing recent 30 mails for ${account.email}...',
+                  ? 'Deep Scanning in 20-mail packets for ${account.email} (Live Updating)...'
+                  : 'Incremental Quick Syncing new mails for ${account.email}...',
             ),
           ),
         );
@@ -406,144 +519,162 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
       var authenticateClient = GoogleAuthClient(authHeaders);
       var gmailApi = gmail.GmailApi(authenticateClient);
 
-      const String query = '-from:linkedin.com -from:insideiim.com -from:smule.com -category:social '
-          '(deadline OR "application published" OR "application modified" OR "process update" OR shortlisted '
-          'OR "batch meet" OR "mandatorily" OR "surprise quiz" OR "assessment form" OR "assigned reading" '
-          'OR "interest form" OR "paper cribs" OR "endterm" OR "midterm" OR "scholarship" OR "nbfa" '
-          'OR "submission" OR "submit" OR "round" OR "eod" OR "conclave" OR "case competition" OR "unstop" '
-          'OR "parcel" OR "copy check" OR "answer sheet" OR "shuttle" OR "buggy" OR "mess" OR "library" '
-          'OR "raymond" OR "decathlon" OR "venue" OR "timing" OR "closed" OR "collect" OR "schedule")';
+      // Broader, inclusive query so no deadline or campus notice is missed
+      const String baseQuery = '-from:linkedin.com -from:insideiim.com -from:smule.com -category:social -category:promotions '
+          '(deadline OR due OR "by eod" OR "last date" OR "final call" OR "closing" OR "closes" '
+          'OR "application" OR "process update" OR shortlisted OR "batch meet" OR "mandatorily" '
+          'OR "quiz" OR "assessment" OR "reading" OR "form" OR "cribs" OR "endterm" OR "midterm" '
+          'OR "scholarship" OR "nbfa" OR "submission" OR "submit" OR "register" OR "registration" '
+          'OR "round" OR "conclave" OR "competition" OR "unstop" OR "case" OR "ppt" OR "placement" '
+          'OR "parcel" OR "copy check" OR "answer sheet" OR "shuttle" OR "buggy" OR "mess" '
+          'OR "library" OR "raymond" OR "decathlon" OR "venue" OR "timing" OR "closed" OR "collect" OR "schedule")';
 
-      List<gmail.Message> allFetchedSummaries = [];
+      // Smart Timestamp Filter for Quick/Incremental Sync (with 10-min safety buffer)
+      String activeQuery = baseQuery;
+      if (!isFirstScanForAccount && lastSyncSec != null) {
+        final safeBufferEpoch = lastSyncSec - 600;
+        activeQuery = '$baseQuery after:$safeBufferEpoch';
+      }
 
-      try {
-        if (isFirstScanForAccount) {
-          String? pageToken;
-          int pagesScanned = 0;
-          do {
-            setState(() => _syncProgressText = 'p.${pagesScanned + 1}');
-            final messagesResponse = await gmailApi.users.messages.list(
+      List<DeadlineItem> allSessionNewDeadlines = [];
+      List<ReminderItem> allSessionNewReminders = [];
+
+      String? pageToken;
+      int packetNumber = 0;
+      final int maxPackets = isFirstScanForAccount ? 10 : 5;
+
+      do {
+        packetNumber++;
+        if (mounted) {
+          setState(() {
+            _syncProgressText = isFirstScanForAccount ? 'P-$packetNumber' : '⚡$packetNumber';
+          });
+        }
+
+        gmail.ListMessagesResponse messagesResponse;
+        try {
+          messagesResponse = await gmailApi.users.messages.list(
+            'me',
+            q: activeQuery,
+            maxResults: 20, // 20-mail packet chunking
+            pageToken: pageToken,
+          );
+        } catch (err) {
+          if (err.toString().contains('401')) {
+            await _googleSignIn.signOut();
+            account = await _googleSignIn.signIn();
+            if (account == null) rethrow;
+            authHeaders = await account.authHeaders;
+            authenticateClient = GoogleAuthClient(authHeaders);
+            gmailApi = gmail.GmailApi(authenticateClient);
+            messagesResponse = await gmailApi.users.messages.list(
               'me',
-              q: query,
-              maxResults: 100,
+              q: activeQuery,
+              maxResults: 20,
               pageToken: pageToken,
             );
-            if (messagesResponse.messages != null) {
-              allFetchedSummaries.addAll(messagesResponse.messages!);
-            }
-            pageToken = messagesResponse.nextPageToken;
-            pagesScanned++;
-          } while (pageToken != null && pagesScanned < 3);
-        } else {
-          setState(() => _syncProgressText = '30');
-          final messagesResponse = await gmailApi.users.messages.list(
+          } else {
+            rethrow;
+          }
+        }
+
+        final packetSummaries = messagesResponse.messages ?? [];
+        if (packetSummaries.isEmpty) break;
+
+        List<Map<String, String>> packetRawEmails = [];
+
+        for (var msgSummary in packetSummaries) {
+          if (msgSummary.id == null) continue;
+          final alreadyInDeadlines = deadlines.any((d) =>
+              d.gmailMessageId == msgSummary.id || d.id == 'gmail_${msgSummary.id}');
+          final alreadyInReminders = reminders.any((r) =>
+              r.gmailMessageId == msgSummary.id || r.id == 'rem_${msgSummary.id}');
+          if (alreadyInDeadlines || alreadyInReminders) {
+            continue;
+          }
+
+          final msg = await gmailApi.users.messages.get(
             'me',
-            q: query,
-            maxResults: 30,
+            msgSummary.id!,
+            format: 'metadata',
+            metadataHeaders: ['Subject', 'From', 'Date'],
           );
-          if (messagesResponse.messages != null) {
-            allFetchedSummaries.addAll(messagesResponse.messages!);
+
+          String subject = '';
+          String from = '';
+          String dateHeader = '';
+          final headers = msg.payload?.headers ?? [];
+          for (var h in headers) {
+            final name = h.name?.toLowerCase();
+            if (name == 'subject') subject = h.value ?? '';
+            if (name == 'from') from = h.value ?? '';
+            if (name == 'date') dateHeader = h.value ?? '';
+          }
+
+          String snippet = msg.snippet ?? '';
+          String internalDateMs = msg.internalDate ?? DateTime.now().millisecondsSinceEpoch.toString();
+
+          packetRawEmails.add({
+            'id': msgSummary.id!,
+            'subject': subject,
+            'from': from,
+            'dateHeader': dateHeader,
+            'internalDateMs': internalDateMs,
+            'snippet': snippet,
+            'accountEmail': account!.email,
+          });
+        }
+
+        if (packetRawEmails.isNotEmpty) {
+          final bool markAsNewGlow = !isFirstScanForAccount || isBackgroundAutoSync;
+          final packetDeadlines = parseEmailsToDeadlines(packetRawEmails, markAsNew: markAsNewGlow);
+          final packetReminders = parseEmailsToReminders(packetRawEmails, markAsNew: markAsNewGlow);
+
+          if (packetDeadlines.isNotEmpty || packetReminders.isNotEmpty) {
+            allSessionNewDeadlines.addAll(packetDeadlines);
+            allSessionNewReminders.addAll(packetReminders);
+
+            if (mounted) {
+              final now = DateTime.now();
+              setState(() {
+                deadlines.removeWhere((d) => d.dueDate.isBefore(now) && !d.isCompleted);
+                deadlines.addAll(packetDeadlines);
+                reminders.insertAll(0, packetReminders);
+              });
+              await _saveDataToLocal();
+            }
           }
         }
-      } catch (err) {
-        if (err.toString().contains('401')) {
-          await _googleSignIn.signOut();
-          account = await _googleSignIn.signIn();
-          if (account == null) rethrow;
-          authHeaders = await account.authHeaders;
-          authenticateClient = GoogleAuthClient(authHeaders);
-          gmailApi = gmail.GmailApi(authenticateClient);
-          final retryResp = await gmailApi.users.messages.list('me', q: query, maxResults: 30);
-          if (retryResp.messages != null) {
-            allFetchedSummaries.addAll(retryResp.messages!);
-          }
-        } else {
-          rethrow;
-        }
-      }
 
-      List<Map<String, String>> rawEmails = [];
-      int count = 0;
+        pageToken = messagesResponse.nextPageToken;
+      } while (pageToken != null && packetNumber < maxPackets);
 
-      for (var msgSummary in allFetchedSummaries) {
-        if (msgSummary.id == null) continue;
-        final alreadyInDeadlines = deadlines.any((d) => d.gmailMessageId == msgSummary.id || d.id == 'gmail_${msgSummary.id}');
-        final alreadyInReminders = reminders.any((r) => r.gmailMessageId == msgSummary.id || r.id == 'rem_${msgSummary.id}');
-        if (alreadyInDeadlines || alreadyInReminders) {
-          continue;
-        }
-
-        count++;
-        if (mounted) {
-          setState(() => _syncProgressText = '$count');
-        }
-
-        final msg = await gmailApi.users.messages.get(
-          'me',
-          msgSummary.id!,
-          format: 'metadata',
-          metadataHeaders: ['Subject', 'From', 'Date'],
-        );
-
-        String subject = '';
-        String from = '';
-        String dateHeader = '';
-        final headers = msg.payload?.headers ?? [];
-        for (var h in headers) {
-          final name = h.name?.toLowerCase();
-          if (name == 'subject') subject = h.value ?? '';
-          if (name == 'from') from = h.value ?? '';
-          if (name == 'date') dateHeader = h.value ?? '';
-        }
-
-        String snippet = msg.snippet ?? '';
-        String internalDateMs = msg.internalDate ?? DateTime.now().millisecondsSinceEpoch.toString();
-
-        rawEmails.add({
-          'id': msgSummary.id!,
-          'subject': subject,
-          'from': from,
-          'dateHeader': dateHeader,
-          'internalDateMs': internalDateMs,
-          'snippet': snippet,
-          'accountEmail': account.email,
-        });
-      }
-
-      final newDeadlines = parseEmailsToDeadlines(rawEmails);
-      final newReminders = parseEmailsToReminders(rawEmails);
-
-      if (!syncedAccounts.contains(account.email)) {
+      if (!syncedAccounts.contains(account!.email)) {
         syncedAccounts.add(account.email);
       }
+      lastSyncEpochByAccount[account.email] = syncStartEpochSec;
+      await _saveDataToLocal();
 
       if (!mounted) return;
 
-      final now = DateTime.now();
-      setState(() {
-        deadlines.removeWhere((d) => d.dueDate.isBefore(now) && !d.isCompleted);
-        deadlines.addAll(newDeadlines);
-        reminders.insertAll(0, newReminders);
-      });
-      await _saveDataToLocal();
-
-      if (newDeadlines.isNotEmpty || newReminders.isNotEmpty) {
+      if (allSessionNewDeadlines.isNotEmpty || allSessionNewReminders.isNotEmpty) {
         _recordAction(
-          description: 'Synced ${newDeadlines.length} deadlines & ${newReminders.length} reminders',
+          description:
+              'Synced ${allSessionNewDeadlines.length} deadlines & ${allSessionNewReminders.length} reminders',
           actionType: 'sync',
           onUndo: () {
             setState(() {
-              for (var item in newDeadlines) {
+              for (var item in allSessionNewDeadlines) {
                 deadlines.removeWhere((d) => d.id == item.id);
               }
-              for (var rem in newReminders) {
+              for (var rem in allSessionNewReminders) {
                 reminders.removeWhere((r) => r.id == rem.id);
               }
             });
             _saveDataToLocal();
           },
         );
-      } else if (!isAuto) {
+      } else if (!isAuto && !isBackgroundAutoSync) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Sync complete — you are all caught up!'),
@@ -552,7 +683,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
       }
     } catch (e) {
       if (!mounted) return;
-      if (!isAuto) {
+      if (!isAuto && !isBackgroundAutoSync) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Gmail Sync Error: $e')),
         );
@@ -567,7 +698,48 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     }
   }
 
-  List<ReminderItem> parseEmailsToReminders(List<Map<String, String>> rawEmails) {
+  DateTime _calculateReminderExpiry(String text, DateTime emailSentDate) {
+    final now = DateTime.now();
+    final rangeRegex = RegExp(
+      r'(?:to|-|till|until)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b',
+      caseSensitive: false,
+    );
+    final singleTimeRegex = RegExp(
+      r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b',
+      caseSensitive: false,
+    );
+
+    RegExpMatch? match = rangeRegex.firstMatch(text) ?? singleTimeRegex.firstMatch(text);
+
+    DateTime baseDate = _extractDueDateFromText(
+          subject: text,
+          snippet: '',
+          emailSentDate: emailSentDate,
+        ) ??
+        emailSentDate;
+
+    if (match != null) {
+      int hour = int.parse(match.group(1)!);
+      int minute = match.group(2) != null ? int.parse(match.group(2)!) : 0;
+      String amPm = match.group(3)!.toLowerCase();
+      if (amPm == 'pm' && hour < 12) hour += 12;
+      if (amPm == 'am' && hour == 12) hour = 0;
+
+      final eventDateTime = DateTime(baseDate.year, baseDate.month, baseDate.day, hour, minute);
+      return eventDateTime.add(const Duration(minutes: 30));
+    }
+
+    final fallbackEnd = DateTime(emailSentDate.year, emailSentDate.month, emailSentDate.day, 23, 59);
+    if (fallbackEnd.isBefore(now)) {
+      return now.add(const Duration(minutes: 30));
+    }
+    return fallbackEnd.add(const Duration(minutes: 30));
+  }
+
+  List<ReminderItem> parseEmailsToReminders(
+    List<Map<String, String>> rawEmails, {
+    bool markAsNew = false,
+  }) {
     List<ReminderItem> extractedReminders = [];
     final now = DateTime.now();
 
@@ -605,6 +777,9 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
 
       if (!isCampusScheduleOrReminder) continue;
 
+      final expiresAt = _calculateReminderExpiry('$subject $snippet', emailSentDate);
+      if (now.isAfter(expiresAt)) continue;
+
       final timeRegex = RegExp(r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b', caseSensitive: false);
       final timeMatch = timeRegex.firstMatch('$subject $snippet');
       String timeBadge = timeMatch != null
@@ -619,6 +794,8 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
           timeLabel: timeBadge,
           gmailMessageId: msgId,
           source: accountEmail,
+          expiresAt: expiresAt,
+          isNew: markAsNew,
         ),
       );
     }
@@ -626,7 +803,10 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     return extractedReminders;
   }
 
-  List<DeadlineItem> parseEmailsToDeadlines(List<Map<String, String>> rawEmails) {
+  List<DeadlineItem> parseEmailsToDeadlines(
+    List<Map<String, String>> rawEmails, {
+    bool markAsNew = false,
+  }) {
     List<DeadlineItem> parsedDeadlines = [];
     final now = DateTime.now();
 
@@ -668,6 +848,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
           source: accountEmail,
           gmailMessageId: msgId,
           importance: importance,
+          isNew: markAsNew,
         ),
       );
     }
@@ -758,8 +939,12 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     }
 
     if (combined.contains('deadline') ||
+        combined.contains('due by') ||
+        combined.contains('due on') ||
+        combined.contains('last date') ||
         combined.contains('submission') ||
         combined.contains('submit') ||
+        combined.contains('register by') ||
         combined.contains('interest form') ||
         combined.contains('assigned reading') ||
         combined.contains('report guidelines') ||
@@ -777,7 +962,10 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
 
   String _autoClassifyEmail(String subject, String body, String from) {
     final text = '${subject.toLowerCase()} ${body.toLowerCase()} ${from.toLowerCase()}';
-    if (text.contains('scholarship') || text.contains('financial assistance') || text.contains('nbfa') || text.contains('buddy4study')) {
+    if (text.contains('scholarship') ||
+        text.contains('financial assistance') ||
+        text.contains('nbfa') ||
+        text.contains('buddy4study')) {
       return 'Scholarships';
     } else if (text.contains('application published') ||
         text.contains('application modified') ||
@@ -804,9 +992,11 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
         text.contains('assigned reading') ||
         text.contains('paper cribs') ||
         text.contains('endterm') ||
+        text.contains('midterm') ||
         text.contains('rep2026') ||
         text.contains('session') ||
         text.contains('prof.') ||
+        text.contains('course') ||
         text.contains('pgp')) {
       return 'Acads / PGP';
     } else if (text.contains('interest form') ||
@@ -823,7 +1013,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
         text.contains('kaizen')) {
       return 'Clubs & Comm';
     }
-    return 'Acads / PGP';
+    return 'Miscellaneous';
   }
 
   String _extractSubCategory(String text, String from) {
@@ -958,8 +1148,12 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
   @override
   void dispose() {
     _statusTabController.dispose();
+    _newItemPulseController.dispose();
     _scrollController.dispose();
     _cleanupTimer?.cancel();
+    _liveCountdownTicker?.cancel();
+    _autoSyncTimer?.cancel();
+    _popStateSub?.cancel();
     super.dispose();
   }
 
@@ -968,9 +1162,20 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     final savedCats = prefs.getStringList('saved_categories');
     if (savedCats != null && savedCats.isNotEmpty) {
       categories = savedCats;
+      if (!categories.contains('Miscellaneous')) {
+        categories.add('Miscellaneous');
+      }
     }
 
     syncedAccounts = prefs.getStringList('synced_accounts') ?? [];
+    final syncMapJson = prefs.getString('last_sync_epoch_map');
+    if (syncMapJson != null) {
+      try {
+        final decoded = jsonDecode(syncMapJson) as Map<String, dynamic>;
+        lastSyncEpochByAccount = decoded.map((k, v) => MapEntry(k, (v as num).toInt()));
+      } catch (_) {}
+    }
+
     savedUserEmail = prefs.getString('saved_user_email');
     savedUserName = prefs.getString('saved_user_name');
     savedUserPhoto = prefs.getString('saved_user_photo');
@@ -1002,6 +1207,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('saved_categories', categories);
     await prefs.setStringList('synced_accounts', syncedAccounts);
+    await prefs.setString('last_sync_epoch_map', jsonEncode(lastSyncEpochByAccount));
     if (savedUserEmail != null) await prefs.setString('saved_user_email', savedUserEmail!);
     if (savedUserName != null) await prefs.setString('saved_user_name', savedUserName!);
     if (savedUserPhoto != null) await prefs.setString('saved_user_photo', savedUserPhoto!);
@@ -1017,6 +1223,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     final now = DateTime.now();
     setState(() {
       deadlines.removeWhere((item) => now.difference(item.dueDate).inHours >= 48);
+      reminders.removeWhere((rem) => now.isAfter(rem.expiresAt));
       actionHistory.removeWhere((log) => now.difference(log.timestamp).inHours >= 24);
     });
     _saveDataToLocal();
@@ -1075,12 +1282,16 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
   void _toggleComplete(DeadlineItem item, bool? val) {
     setState(() {
       item.isCompleted = val ?? false;
+      item.isNew = false;
     });
     _saveDataToLocal();
   }
 
   void _moveToTrash(DeadlineItem item) {
-    setState(() => item.isDeleted = true);
+    setState(() {
+      item.isDeleted = true;
+      item.isNew = false;
+    });
     _recordAction(
       description: 'Moved "${item.title}" to Trash',
       actionType: 'delete',
@@ -1127,15 +1338,23 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
   String _formatRemainingTime(DateTime dueDate) {
     final diff = dueDate.difference(DateTime.now());
     if (diff.isNegative) {
-      return 'Overdue ${diff.inHours.abs()}h';
+      final absDiff = diff.abs();
+      final h = absDiff.inHours;
+      final m = (absDiff.inMinutes % 60).toString().padLeft(2, '0');
+      final s = (absDiff.inSeconds % 60).toString().padLeft(2, '0');
+      return 'Overdue ${h}h ${m}m ${s}s';
     }
     if (diff.inHours < 24) {
-      return '${diff.inHours}h ${diff.inMinutes % 60}m left';
+      final h = diff.inHours.toString().padLeft(2, '0');
+      final m = (diff.inMinutes % 60).toString().padLeft(2, '0');
+      final s = (diff.inSeconds % 60).toString().padLeft(2, '0');
+      return '${h}h ${m}m ${s}s left';
     }
     return '${diff.inDays}d ${diff.inHours % 24}h left';
   }
 
   void _showEmailSummaryDialog(DeadlineItem item) {
+    _markDeadlineInteracted(item);
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -1258,98 +1477,106 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     pendingItems.sort((a, b) => a.dueDate.compareTo(b.dueDate));
     completedItems.sort((a, b) => a.dueDate.compareTo(b.dueDate));
 
-    return Scaffold(
-      backgroundColor: const Color(0xFF050E0A),
-      body: SafeArea(
-        child: Stack(
-          children: [
-            Container(
-              margin: EdgeInsets.all(isWideScreen ? 14 : 6),
-              clipBehavior: Clip.antiAlias,
-              decoration: BoxDecoration(
-                color: const Color(0xFF08150F),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: const Color(0xFF5A381E).withValues(alpha: 0.55),
-                  width: 1.5,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.6),
-                    blurRadius: 24,
-                    offset: const Offset(0, 8),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (currentView != ViewMode.board) {
+          setState(() => currentView = ViewMode.board);
+        }
+      },
+      child: Scaffold(
+        backgroundColor: const Color(0xFF050E0A),
+        body: SafeArea(
+          child: Stack(
+            children: [
+              Container(
+                margin: EdgeInsets.all(isWideScreen ? 14 : 6),
+                clipBehavior: Clip.antiAlias,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF08150F),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: const Color(0xFF5A381E).withValues(alpha: 0.55),
+                    width: 1.5,
                   ),
-                ],
-              ),
-              child: InteractiveParticleBackground(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _buildTopHeader(isWideScreen),
-
-                    if (currentView == ViewMode.board) ...[
-                      AnimatedSize(
-                        duration: const Duration(milliseconds: 220),
-                        curve: Curves.easeOutCubic,
-                        child: _isScrolled
-                            ? const SizedBox.shrink()
-                            : Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  _buildHeroBanner(criticalCount, isWideScreen),
-                                  _buildRemindersStrip(),
-                                ],
-                              ),
-                      ),
-                      _buildCategoryFilterBar(criticalCount),
-                      _buildPendingCompletedTabs(pendingItems.length, completedItems.length),
-                    ],
-
-                    Expanded(
-                      child: currentView == ViewMode.history
-                          ? _buildHistoryView()
-                          : currentView == ViewMode.trash
-                              ? _buildScrollableDeadlinesView(baseFiltered, isWideScreen)
-                              : currentView == ViewMode.feedback
-                                  ? _buildVoiceBoxView()
-                                  : TabBarView(
-                                      controller: _statusTabController,
-                                      children: [
-                                        _buildScrollableDeadlinesView(pendingItems, isWideScreen),
-                                        _buildScrollableDeadlinesView(completedItems, isWideScreen),
-                                      ],
-                                    ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.6),
+                      blurRadius: 24,
+                      offset: const Offset(0, 8),
                     ),
                   ],
                 ),
-              ),
-            ),
-            if (activeUndoToasts.isNotEmpty)
-              Positioned(
-                bottom: 20,
-                left: 16,
-                right: 16,
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 420),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: activeUndoToasts.map((toast) {
-                        return Padding(
-                          key: ValueKey(toast.id),
-                          padding: const EdgeInsets.only(top: 8),
-                          child: _UndoBarWidget(
-                            message: toast.message,
-                            onUndo: toast.onUndo,
-                            onDismiss: () => _removeUndoToast(toast.id),
-                          ),
-                        );
-                      }).toList(),
-                    ),
+                child: AmbientParticleBackground(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _buildTopHeader(isWideScreen),
+
+                      if (currentView == ViewMode.board) ...[
+                        AnimatedSize(
+                          duration: const Duration(milliseconds: 220),
+                          curve: Curves.easeOutCubic,
+                          child: _isScrolled
+                              ? const SizedBox.shrink()
+                              : Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    _buildHeroBanner(criticalCount, isWideScreen),
+                                    _buildRemindersStrip(),
+                                  ],
+                                ),
+                        ),
+                        _buildCategoryFilterBar(criticalCount),
+                        _buildPendingCompletedTabs(pendingItems.length, completedItems.length),
+                      ],
+
+                      Expanded(
+                        child: currentView == ViewMode.history
+                            ? _buildHistoryView()
+                            : currentView == ViewMode.trash
+                                ? _buildScrollableDeadlinesView(baseFiltered, isWideScreen)
+                                : currentView == ViewMode.feedback
+                                    ? _buildVoiceBoxView()
+                                    : TabBarView(
+                                        controller: _statusTabController,
+                                        children: [
+                                          _buildScrollableDeadlinesView(pendingItems, isWideScreen),
+                                          _buildScrollableDeadlinesView(completedItems, isWideScreen),
+                                        ],
+                                      ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-          ],
+              if (activeUndoToasts.isNotEmpty)
+                Positioned(
+                  bottom: 20,
+                  left: 16,
+                  right: 16,
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 420),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: activeUndoToasts.map((toast) {
+                          return Padding(
+                            key: ValueKey(toast.id),
+                            padding: const EdgeInsets.only(top: 8),
+                            child: _UndoBarWidget(
+                              message: toast.message,
+                              onUndo: toast.onUndo,
+                              onDismiss: () => _removeUndoToast(toast.id),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -1403,7 +1630,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
                       ),
                     ),
                     Text(
-                      'B-School Workspace',
+                      'B-School Workspace • Auto-Sync Active',
                       style: TextStyle(fontSize: 10, color: Colors.white54),
                     ),
                   ],
@@ -1446,8 +1673,8 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
       children: [
         _buildIconOnlyActionButton(
           icon: Icons.mail_outline_rounded,
-          tooltip: hasDoneDeepScan ? 'Quick Sync (30)' : 'Deep Sync Gmail',
-          badgeText: _isSyncing ? _syncProgressText : (hasDoneDeepScan ? '30' : '↻'),
+          tooltip: hasDoneDeepScan ? 'Incremental Quick Sync' : 'Batched Deep Sync (20-pack)',
+          badgeText: _isSyncing ? _syncProgressText : (hasDoneDeepScan ? '⚡' : '↻'),
           isActive: _isSyncing,
           accentColor: const Color(0xFFFBBF24),
           isLoading: _isSyncing,
@@ -1591,7 +1818,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
               children: [
                 const Icon(Icons.mail_outline_rounded, size: 16, color: Color(0xFFFBBF24)),
                 const SizedBox(width: 10),
-                Text(hasDoneDeepScan ? 'Quick Sync (30)' : 'Sync Gmail', style: const TextStyle(fontSize: 12.5)),
+                Text(hasDoneDeepScan ? 'Incremental Quick Sync' : 'Sync Gmail (20-pack)', style: const TextStyle(fontSize: 12.5)),
               ],
             ),
           ),
@@ -1652,7 +1879,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
               children: [
                 Icon(Icons.radar_rounded, size: 16, color: Color(0xFF34D399)),
                 SizedBox(width: 10),
-                Text('Force Full Deep Scan', style: TextStyle(fontSize: 12.5)),
+                Text('Force 20-Pack Deep Scan', style: TextStyle(fontSize: 12.5)),
               ],
             ),
           ),
@@ -1773,7 +2000,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'Placements, Acads, Case Comps & Live Campus Schedule.',
+                  'Placements, Acads, Case Comps, Miscellaneous & Auto-Expiring Reminders.',
                   style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.55)),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -1825,8 +2052,8 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
               const Icon(Icons.schedule_rounded, size: 13, color: Color(0xFFFBBF24)),
               const SizedBox(width: 5),
               Text(
-                'CAMPUS REMINDERS & SCHEDULE (${reminders.length})',
-                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.7, color: Colors.white70),
+                'CAMPUS REMINDERS & SCHEDULE (${reminders.length}) • AUTO-CLEARS 30M POST-EXPIRY',
+                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.6, color: Colors.white70),
               ),
               const Spacer(),
               HoverScaleGlow(
@@ -1869,89 +2096,129 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
                     separatorBuilder: (_, __) => const SizedBox(width: 8),
                     itemBuilder: (context, index) {
                       final r = reminders[index];
-                      return HoverScaleGlow(
-                        scale: 1.04,
-                        glowColor: const Color(0xFFFBBF24),
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: r.gmailMessageId != null
-                            ? () => _openExactEmailById(r.gmailMessageId, r.title, r.source)
-                            : () {
+                      return AnimatedBuilder(
+                        animation: _newItemPulseController,
+                        builder: (context, _) {
+                          final pulseAlpha = r.isNew ? (0.25 + _newItemPulseController.value * 0.45) : 0.0;
+                          return HoverScaleGlow(
+                            scale: 1.04,
+                            glowColor: const Color(0xFFFBBF24),
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () {
+                              _markReminderInteracted(r);
+                              if (r.gmailMessageId != null) {
+                                _openExactEmailById(r.gmailMessageId, r.title, r.source);
+                              } else {
                                 setState(() => r.isDone = !r.isDone);
                                 _saveDataToLocal();
-                              },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.05),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: const Color(0xFFFBBF24).withValues(alpha: 0.35)),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              InkWell(
-                                onTap: () {
-                                  setState(() => r.isDone = !r.isDone);
-                                  _saveDataToLocal();
-                                },
-                                child: Container(
-                                  width: 15,
-                                  height: 15,
-                                  alignment: Alignment.center,
-                                  decoration: BoxDecoration(
-                                    color: r.isDone ? const Color(0xFF10B981) : Colors.transparent,
-                                    shape: BoxShape.circle,
-                                    border: Border.all(
-                                      color: r.isDone ? const Color(0xFF34D399) : const Color(0xFFFBBF24),
-                                      width: 1.3,
+                              }
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.05),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: r.isNew
+                                      ? const Color(0xFF34D399).withValues(alpha: 0.9)
+                                      : const Color(0xFFFBBF24).withValues(alpha: 0.35),
+                                  width: r.isNew ? 1.5 : 1.0,
+                                ),
+                                boxShadow: r.isNew
+                                    ? [
+                                        BoxShadow(
+                                          color: const Color(0xFF10B981).withValues(alpha: pulseAlpha),
+                                          blurRadius: 12,
+                                          spreadRadius: 1,
+                                        ),
+                                      ]
+                                    : [],
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  InkWell(
+                                    onTap: () {
+                                      setState(() {
+                                        r.isDone = !r.isDone;
+                                        r.isNew = false;
+                                      });
+                                      _saveDataToLocal();
+                                    },
+                                    child: Container(
+                                      width: 15,
+                                      height: 15,
+                                      alignment: Alignment.center,
+                                      decoration: BoxDecoration(
+                                        color: r.isDone ? const Color(0xFF10B981) : Colors.transparent,
+                                        shape: BoxShape.circle,
+                                        border: Border.all(
+                                          color: r.isDone ? const Color(0xFF34D399) : const Color(0xFFFBBF24),
+                                          width: 1.3,
+                                        ),
+                                      ),
+                                      child: r.isDone
+                                          ? const Icon(Icons.check_rounded, size: 10, color: Colors.black)
+                                          : null,
                                     ),
                                   ),
-                                  child: r.isDone
-                                      ? const Icon(Icons.check_rounded, size: 10, color: Colors.black)
-                                      : null,
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              ConstrainedBox(
-                                constraints: const BoxConstraints(maxWidth: 210),
-                                child: Text(
-                                  r.title,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 11.5,
-                                    fontWeight: FontWeight.w600,
-                                    decoration: r.isDone ? TextDecoration.lineThrough : null,
-                                    color: r.isDone ? Colors.white38 : Colors.white,
+                                  const SizedBox(width: 6),
+                                  if (r.isNew) ...[
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF10B981),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: const Text(
+                                        'NEW',
+                                        style: TextStyle(fontSize: 8, fontWeight: FontWeight.w900, color: Colors.black),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 5),
+                                  ],
+                                  ConstrainedBox(
+                                    constraints: const BoxConstraints(maxWidth: 210),
+                                    child: Text(
+                                      r.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                        decoration: r.isDone ? TextDecoration.lineThrough : null,
+                                        color: r.isDone ? Colors.white38 : Colors.white,
+                                      ),
+                                    ),
                                   ),
-                                ),
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFFFBBF24).withValues(alpha: 0.16),
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: Text(
+                                      r.timeLabel,
+                                      style: const TextStyle(fontSize: 9.5, color: Color(0xFFFBBF24), fontWeight: FontWeight.bold),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  InkWell(
+                                    onTap: () {
+                                      setState(() => reminders.removeAt(index));
+                                      _saveDataToLocal();
+                                    },
+                                    child: const Text(
+                                      '✕',
+                                      style: TextStyle(fontSize: 11, color: Colors.white54, fontWeight: FontWeight.bold),
+                                    ),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(width: 6),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFFFBBF24).withValues(alpha: 0.16),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  r.timeLabel,
-                                  style: const TextStyle(fontSize: 9.5, color: Color(0xFFFBBF24), fontWeight: FontWeight.bold),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              InkWell(
-                                onTap: () {
-                                  setState(() => reminders.removeAt(index));
-                                  _saveDataToLocal();
-                                },
-                                child: const Text(
-                                  '✕',
-                                  style: TextStyle(fontSize: 11, color: Colors.white54, fontWeight: FontWeight.bold),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                            ),
+                          );
+                        },
                       );
                     },
                   ),
@@ -2089,7 +2356,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
             children: [
               Container(width: 6, height: 6, decoration: const BoxDecoration(color: Color(0xFF10B981), shape: BoxShape.circle)),
               const SizedBox(width: 4),
-              Text('Local', style: TextStyle(fontSize: 10, color: Colors.white.withValues(alpha: 0.45))),
+              Text('Live Sync', style: TextStyle(fontSize: 10, color: Colors.white.withValues(alpha: 0.45))),
               const SizedBox(width: 8),
               HoverScaleGlow(
                 scale: 1.1,
@@ -2148,14 +2415,17 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
             style: FilledButton.styleFrom(backgroundColor: const Color(0xFF10B981)),
             onPressed: () {
               if (titleCtrl.text.trim().isEmpty) return;
+              final timeText = timeCtrl.text.trim().isEmpty ? 'Scheduled' : timeCtrl.text.trim();
+              final exp = _calculateReminderExpiry(timeText, DateTime.now());
               setState(() {
                 reminders.insert(
                   0,
                   ReminderItem(
                     id: DateTime.now().millisecondsSinceEpoch.toString(),
                     title: titleCtrl.text.trim(),
-                    timeLabel: timeCtrl.text.trim().isEmpty ? 'Scheduled' : timeCtrl.text.trim(),
+                    timeLabel: timeText,
                     source: 'Manual',
+                    expiresAt: exp,
                   ),
                 );
               });
@@ -2204,11 +2474,14 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('1. Minimal Icon Bar & Auto-Collapse:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-              Text('Top action buttons use clean icons. When you scroll down, they tuck neatly inside your top-right Profile Menu so your deadlines get full screen space.', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
+              Text('1. Batched 20-Mail Deep Scan & Timestamp Quick Sync:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              Text('First scan runs in fast 20-mail packets updating your dashboard live. Subsequent syncs use your exact last-sync timestamp so zero emails are missed.', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
               SizedBox(height: 10),
-              Text('2. Auto-Synced Campus Reminders:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-              Text('Syncing Gmail automatically extracts both Deadlines and Campus Schedule alerts (like Parcel timings, Paper Cribs, Copy Check, Shuttle, etc.). You can also add custom reminders with "+ Reminder".', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
+              Text('2. 30-Min Auto-Sync & New Item Glow:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              Text('Green Board checks for new deadlines every 30 minutes automatically. Newly discovered items glow until you click or interact with them.', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
+              SizedBox(height: 10),
+              Text('3. Live Second Countdown & Auto-Expiring Reminders:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              Text('Critical red deadlines tick down second-by-second. Campus reminders automatically disappear 30 minutes after their scheduled time.', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
             ],
           ),
         ),
@@ -2236,9 +2509,9 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
           children: [
             const Text('Green Board • B-School Workspace', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Colors.white)),
             const SizedBox(height: 6),
-            const Text('Version 2.7.0 (Hover Glow & Scale + Gmail Reminders + Particle Mesh)', style: TextStyle(fontSize: 12, color: Colors.white54)),
+            const Text('Version 3.0.0 (Batched Live Sync + Second Ticker + 30m Auto-Sync Glow)', style: TextStyle(fontSize: 12, color: Colors.white54)),
             const SizedBox(height: 10),
-            const Text('Built for B-School students to zero in on Placement Committee deadlines, surprise quizzes, case comps, and daily campus schedules.', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
+            const Text('Built for B-School students to zero in on Placement Committee deadlines, surprise quizzes, case comps, miscellaneous tasks, and daily campus schedules.', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
             const SizedBox(height: 14),
             const Text('Created by _Bronkind_', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF34D399))),
             const SizedBox(height: 4),
@@ -2277,7 +2550,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
           ),
           const SizedBox(height: 6),
           const Text(
-            'Facing any issues, automation errors, or want a new feature? Type below to send it directly to our Telegram.',
+            'Facing any issues, automation errors, or want a new feature? Type below to send it securely to our Telegram.',
             style: TextStyle(fontSize: 12.5, color: Colors.white60),
           ),
           const SizedBox(height: 14),
@@ -2313,35 +2586,40 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
                   final text = issueCtrl.text.trim();
                   if (text.isEmpty) return;
 
-                  const botToken = '8844738614:AAFb1RNQ77e-6ub1OUBj--n6AQG0QXpOnuk';
-                  const chatId = '1689696474';
-                  final url = Uri.parse('https://api.telegram.org/bot$botToken/sendMessage');
+                  final senderInfo = _googleSignIn.currentUser?.email ?? savedUserEmail ?? 'Anonymous User';
+                  final proxyUrl = Uri.parse(_feedbackProxyUrl);
 
                   try {
+                    // Using text/plain avoids CORS preflight issues on Google Apps Script Web Apps
                     final response = await http.post(
-                      url,
-                      headers: {'Content-Type': 'application/json'},
+                      proxyUrl,
+                      headers: {'Content-Type': 'text/plain;charset=utf-8'},
                       body: jsonEncode({
-                        'chat_id': chatId,
-                        'text': '🚨 New Green Board Feedback:\n\n$text',
+                        'text': '$text\n\n👤 From: $senderInfo',
                       }),
                     );
 
-                    if (response.statusCode == 200) {
+                    if (response.statusCode == 200 || response.statusCode == 302) {
                       setState(() {
                         voiceBoxSubmissions.add({'text': text, 'time': 'Just now'});
                       });
                       issueCtrl.clear();
                       if (mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Feedback sent to Telegram!')),
+                          const SnackBar(content: Text('Feedback sent securely to Telegram!')),
+                        );
+                      }
+                    } else {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text('Proxy returned status ${response.statusCode}')),
                         );
                       }
                     }
                   } catch (e) {
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Error: $e')),
+                        SnackBar(content: Text('Error sending feedback: $e')),
                       );
                     }
                   }
@@ -2417,161 +2695,222 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
     final urgencyColor = _getUrgencyColor(item.dueDate);
     final isTrash = currentView == ViewMode.trash;
     final isVeryImportant = item.importance == 'Very Important';
+    final isCriticalCountdown = item.dueDate.difference(DateTime.now()).inHours <= 24 && !item.isCompleted;
 
-    return HoverScaleGlow(
-      scale: 1.022,
-      glowColor: urgencyColor,
-      borderRadius: BorderRadius.circular(14),
-      onTap: () => _showEmailSummaryDialog(item),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(14),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+    return AnimatedBuilder(
+      animation: _newItemPulseController,
+      builder: (context, _) {
+        final newGlowAlpha = item.isNew ? (0.22 + _newItemPulseController.value * 0.45) : 0.0;
+        return HoverScaleGlow(
+          scale: 1.022,
+          glowColor: item.isNew ? const Color(0xFF34D399) : urgencyColor,
+          borderRadius: BorderRadius.circular(14),
+          onTap: () => _showEmailSummaryDialog(item),
           child: Container(
-            padding: const EdgeInsets.all(13),
             decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.035),
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: urgencyColor.withValues(alpha: 0.45), width: 1.1),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: urgencyColor.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(6),
+              boxShadow: item.isNew
+                  ? [
+                      BoxShadow(
+                        color: const Color(0xFF10B981).withValues(alpha: newGlowAlpha),
+                        blurRadius: 18,
+                        spreadRadius: 1.5,
                       ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
+                    ]
+                  : [],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                child: Container(
+                  padding: const EdgeInsets.all(13),
+                  decoration: BoxDecoration(
+                    color: item.isNew
+                        ? const Color(0xFF10B981).withValues(alpha: 0.08)
+                        : Colors.white.withValues(alpha: 0.035),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: item.isNew
+                          ? const Color(0xFF34D399).withValues(alpha: 0.9)
+                          : urgencyColor.withValues(alpha: 0.45),
+                      width: item.isNew ? 1.6 : 1.1,
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
                         children: [
-                          Icon(Icons.schedule_rounded, size: 11, color: urgencyColor),
-                          const SizedBox(width: 4),
-                          Text(
-                            _formatRemainingTime(item.dueDate),
-                            style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w700, color: urgencyColor),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                            decoration: BoxDecoration(
+                              color: urgencyColor.withValues(alpha: isCriticalCountdown ? 0.22 : 0.15),
+                              borderRadius: BorderRadius.circular(6),
+                              border: isCriticalCountdown
+                                  ? Border.all(color: urgencyColor.withValues(alpha: 0.6), width: 0.8)
+                                  : null,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  isCriticalCountdown ? Icons.timer_rounded : Icons.schedule_rounded,
+                                  size: 11,
+                                  color: urgencyColor,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _formatRemainingTime(item.dueDate),
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w800,
+                                    color: urgencyColor,
+                                    fontFeatures: const [FontFeature.tabularFigures()],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                            decoration: BoxDecoration(
+                              color: isVeryImportant
+                                  ? const Color(0xFFF43F5E).withValues(alpha: 0.15)
+                                  : const Color(0xFF10B981).withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              isVeryImportant ? '🔥 URGENT' : '⚡ IMP',
+                              style: TextStyle(
+                                fontSize: 9,
+                                fontWeight: FontWeight.w800,
+                                color: isVeryImportant ? const Color(0xFFFB7185) : const Color(0xFF34D399),
+                              ),
+                            ),
+                          ),
+                          if (item.isNew) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2.5),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF34D399),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: const Text(
+                                '✨ NEW',
+                                style: TextStyle(
+                                  fontSize: 8.5,
+                                  fontWeight: FontWeight.w900,
+                                  color: Color(0xFF05110C),
+                                ),
+                              ),
+                            ),
+                          ],
+                          const Spacer(),
+                          if (isTrash) ...[
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: const Icon(Icons.restore_rounded, color: Color(0xFF34D399), size: 17),
+                              onPressed: () => _restoreFromTrash(item),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: const Icon(Icons.delete_forever_rounded, color: Color(0xFFF43F5E), size: 17),
+                              onPressed: () => _deletePermanently(item),
+                            ),
+                          ] else ...[
+                            SizedBox(
+                              width: 28,
+                              height: 28,
+                              child: Checkbox(
+                                value: item.isCompleted,
+                                activeColor: const Color(0xFF10B981),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                                onChanged: (val) => _toggleComplete(item, val),
+                              ),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38, size: 17),
+                              onPressed: () => _moveToTrash(item),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 5),
+                      Text(
+                        item.subCategory.toUpperCase(),
+                        style: const TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, letterSpacing: 0.7, color: Colors.white54),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        item.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          decoration: item.isCompleted ? TextDecoration.lineThrough : null,
+                          color: item.isCompleted ? Colors.white38 : const Color(0xFFF8FAFC),
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        item.subtitle,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11.5, color: Colors.white.withValues(alpha: 0.55)),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '${item.category} • Due: ${item.dueDate.day}/${item.dueDate.month} ${item.dueDate.hour}:${item.dueDate.minute.toString().padLeft(2, '0')}',
+                              style: const TextStyle(fontSize: 10.5, color: Colors.white38),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          HoverScaleGlow(
+                            scale: 1.1,
+                            glowColor: const Color(0xFF34D399),
+                            borderRadius: BorderRadius.circular(8),
+                            tooltip: 'Open Exact Mail in Gmail',
+                            onTap: () {
+                              _markDeadlineInteracted(item);
+                              _openExactEmailById(item.gmailMessageId, item.title, item.source);
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF10B981).withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: const Color(0xFF34D399).withValues(alpha: 0.4)),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.mail_outline_rounded, color: Color(0xFF34D399), size: 13),
+                                  SizedBox(width: 4),
+                                  Icon(Icons.open_in_new_rounded, color: Color(0xFF34D399), size: 11),
+                                ],
+                              ),
+                            ),
                           ),
                         ],
                       ),
-                    ),
-                    const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: isVeryImportant
-                            ? const Color(0xFFF43F5E).withValues(alpha: 0.15)
-                            : const Color(0xFF10B981).withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Text(
-                        isVeryImportant ? '🔥 URGENT' : '⚡ IMP',
-                        style: TextStyle(
-                          fontSize: 9,
-                          fontWeight: FontWeight.w800,
-                          color: isVeryImportant ? const Color(0xFFFB7185) : const Color(0xFF34D399),
-                        ),
-                      ),
-                    ),
-                    const Spacer(),
-                    if (isTrash) ...[
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.restore_rounded, color: Color(0xFF34D399), size: 17),
-                        onPressed: () => _restoreFromTrash(item),
-                      ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.delete_forever_rounded, color: Color(0xFFF43F5E), size: 17),
-                        onPressed: () => _deletePermanently(item),
-                      ),
-                    ] else ...[
-                      SizedBox(
-                        width: 28,
-                        height: 28,
-                        child: Checkbox(
-                          value: item.isCompleted,
-                          activeColor: const Color(0xFF10B981),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-                          onChanged: (val) => _toggleComplete(item, val),
-                        ),
-                      ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38, size: 17),
-                        onPressed: () => _moveToTrash(item),
-                      ),
                     ],
-                  ],
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  item.subCategory.toUpperCase(),
-                  style: const TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, letterSpacing: 0.7, color: Colors.white54),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  item.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                    decoration: item.isCompleted ? TextDecoration.lineThrough : null,
-                    color: item.isCompleted ? Colors.white38 : const Color(0xFFF8FAFC),
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  item.subtitle,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 11.5, color: Colors.white.withValues(alpha: 0.55)),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Expanded(
-                      child: Text(
-                        '${item.category} • Due: ${item.dueDate.day}/${item.dueDate.month} ${item.dueDate.hour}:${item.dueDate.minute.toString().padLeft(2, '0')}',
-                        style: const TextStyle(fontSize: 10.5, color: Colors.white38),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    HoverScaleGlow(
-                      scale: 1.1,
-                      glowColor: const Color(0xFF34D399),
-                      borderRadius: BorderRadius.circular(8),
-                      tooltip: 'Open Exact Mail in Gmail',
-                      onTap: () => _openExactEmailById(item.gmailMessageId, item.title, item.source),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF10B981).withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: const Color(0xFF34D399).withValues(alpha: 0.4)),
-                        ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.mail_outline_rounded, color: Color(0xFF34D399), size: 13),
-                            SizedBox(width: 4),
-                            Icon(Icons.open_in_new_rounded, color: Color(0xFF34D399), size: 11),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+              ),
             ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -2727,7 +3066,7 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
                                           setDialogState(() {
                                             titleCtrl.text = _cleanTitle(subj);
                                             snippetCtrl.text = snip;
-                                            chosenCategory = categories.contains(autoCat) ? autoCat : categories[1];
+                                            chosenCategory = categories.contains(autoCat) ? autoCat : 'Miscellaneous';
                                             subCatCtrl.text = autoSub;
                                             if (autoDate != null) selectedDateTime = autoDate;
                                           });
@@ -2833,32 +3172,32 @@ class _GreenBoardHomeState extends State<GreenBoardHome> with SingleTickerProvid
   }
 }
 
-class InteractiveParticleBackground extends StatefulWidget {
+// Non-Interactive Ambient Particle Background (Animated but ignores cursor/touch)
+class AmbientParticleBackground extends StatefulWidget {
   final Widget child;
-  const InteractiveParticleBackground({super.key, required this.child});
+  const AmbientParticleBackground({super.key, required this.child});
 
   @override
-  State<InteractiveParticleBackground> createState() => _InteractiveParticleBackgroundState();
+  State<AmbientParticleBackground> createState() => _AmbientParticleBackgroundState();
 }
 
-class _InteractiveParticleBackgroundState extends State<InteractiveParticleBackground>
+class _AmbientParticleBackgroundState extends State<AmbientParticleBackground>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
   final List<_BgNode> _nodes = [];
-  Offset? _touchPoint;
   final Random _rnd = Random();
 
   @override
   void initState() {
     super.initState();
     _controller = AnimationController(vsync: this, duration: const Duration(seconds: 12))..repeat();
-    for (int i = 0; i < 45; i++) {
+    for (int i = 0; i < 42; i++) {
       _nodes.add(_BgNode(
         x: _rnd.nextDouble(),
         y: _rnd.nextDouble(),
-        vx: (_rnd.nextDouble() - 0.5) * 0.0014,
-        vy: (_rnd.nextDouble() - 0.5) * 0.0014,
-        r: _rnd.nextDouble() * 2.2 + 1.2,
+        vx: (_rnd.nextDouble() - 0.5) * 0.0012,
+        vy: (_rnd.nextDouble() - 0.5) * 0.0012,
+        r: _rnd.nextDouble() * 2.0 + 1.1,
       ));
     }
   }
@@ -2871,30 +3210,20 @@ class _InteractiveParticleBackgroundState extends State<InteractiveParticleBackg
 
   @override
   Widget build(BuildContext context) {
-    return Listener(
-      behavior: HitTestBehavior.translucent,
-      onPointerDown: (e) => setState(() => _touchPoint = e.localPosition),
-      onPointerMove: (e) => setState(() => _touchPoint = e.localPosition),
-      onPointerUp: (_) => setState(() => _touchPoint = null),
-      child: MouseRegion(
-        onHover: (e) => setState(() => _touchPoint = e.localPosition),
-        onExit: (_) => setState(() => _touchPoint = null),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: IgnorePointer(
-                child: AnimatedBuilder(
-                  animation: _controller,
-                  builder: (context, _) => CustomPaint(
-                    painter: _ParticleMeshPainter(nodes: _nodes, pointer: _touchPoint),
-                  ),
-                ),
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: IgnorePointer(
+            child: AnimatedBuilder(
+              animation: _controller,
+              builder: (context, _) => CustomPaint(
+                painter: _ParticleMeshPainter(nodes: _nodes),
               ),
             ),
-            widget.child,
-          ],
+          ),
         ),
-      ),
+        widget.child,
+      ],
     );
   }
 }
@@ -2913,15 +3242,14 @@ class _BgNode {
 
 class _ParticleMeshPainter extends CustomPainter {
   final List<_BgNode> nodes;
-  final Offset? pointer;
 
-  _ParticleMeshPainter({required this.nodes, required this.pointer});
+  _ParticleMeshPainter({required this.nodes});
 
   @override
   void paint(Canvas canvas, Size size) {
-    final dotPaint = Paint()..color = const Color(0xFF34D399).withValues(alpha: 0.45);
+    final dotPaint = Paint()..color = const Color(0xFF34D399).withValues(alpha: 0.38);
     final ambientLinePaint = Paint()
-      ..color = const Color(0xFF10B981).withValues(alpha: 0.08)
+      ..color = const Color(0xFF10B981).withValues(alpha: 0.07)
       ..strokeWidth = 0.8;
 
     final List<Offset> positions = [];
@@ -2937,28 +3265,6 @@ class _ParticleMeshPainter extends CustomPainter {
         final d = (positions[i] - positions[j]).distance;
         if (d < 110) {
           canvas.drawLine(positions[i], positions[j], ambientLinePaint);
-        }
-      }
-    }
-
-    if (pointer != null) {
-      final glowPaint = Paint()
-        ..shader = RadialGradient(
-          colors: [
-            const Color(0xFF10B981).withValues(alpha: 0.18),
-            const Color(0xFF10B981).withValues(alpha: 0.0),
-          ],
-        ).createShader(Rect.fromCircle(center: pointer!, radius: 160));
-      canvas.drawCircle(pointer!, 160, glowPaint);
-
-      for (var pos in positions) {
-        final dist = (pos - pointer!).distance;
-        if (dist < 170) {
-          final alpha = ((1.0 - dist / 170) * 0.65).clamp(0.0, 1.0);
-          final linePaint = Paint()
-            ..color = const Color(0xFF34D399).withValues(alpha: alpha)
-            ..strokeWidth = 1.3;
-          canvas.drawLine(pos, pointer!, linePaint);
         }
       }
     }
